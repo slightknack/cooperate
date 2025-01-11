@@ -1,5 +1,6 @@
 const std = @import("std");
 const Alloc = std.mem.Allocator;
+const assert = std.debug.assert;
 
 /// An array with a fixed maximum size, allocated up front.
 /// If you fill the array with items containing pointers,
@@ -68,7 +69,7 @@ fn StaticArray(comptime T: type, max: usize) type {
         /// This slice will be invalidated if the array is pushed to or extended.
         /// assumes that the new length <= current length.
         pub fn trim(self: *Self, len: usize) []T {
-            std.debug.assert(self.len >= len);
+            assert(self.len >= len);
             const slice = self.items[len..self.len];
             self.len = len;
             return slice;
@@ -77,7 +78,7 @@ fn StaticArray(comptime T: type, max: usize) type {
 }
 
 /// A node in a stack of linked lists.
-/// The bottomost list contains pointers to blocks.
+/// The bottommost list contains pointers to blocks.
 /// Each block should be the size of a cache line or a page, depending on use-case.
 /// Backbone of the KTable.
 fn Node(comptime T: type, k: usize) type {
@@ -137,7 +138,7 @@ fn Node(comptime T: type, k: usize) type {
             var block = try alloc.create(Block);
             block.* = Block.init();
             const extra = block.extend(slice);
-            std.debug.assert(extra.len == 0);
+            assert(extra.len == 0);
             return block;
         }
 
@@ -205,45 +206,159 @@ fn KTable(comptime T: type, k: usize) type {
         const Layer = Node(T, k);
         const Layers = [layers]?*Layer;
 
-        layers: Layers,
         alloc: Alloc,
+        // todo: replace layers and height with StaticArray, that's why you wrote it
+        // layers[0] contains blocks
+        layers: Layers,
+        // height is the index of the first null layer, from layers[0]
+        height: usize,
+        // len is the number of items. Not to be confused with the number of blocks.
+        len: usize,
 
         /// Create a new empty table.
         fn init(alloc: Alloc) Self {
             return Self{
-                .layers = [_]?*Layer{null} ** layers,
                 .alloc = alloc,
+                .layers = [_]?*Layer{null} ** layers,
+                .height = 0,
+                .len = 0,
             };
         }
 
-        // todo: finish implementing this
-        // todo: once this is working, it can be generalized to any layers, e.g. from index.
-        // todo: with a small addition to handle the first block, this method can be the backbone for insertion
-        fn appendFront(self: *Self, slice: []T) error{OutOfMemory}!void {
-            // we build the blocks we will be appending
+        /// Insert the given slice at the given index.
+        /// The index lookup is log(n). Insertion is linear in the size of the slice.
+        /// This method is like the whole point of the KTable,
+        /// arbitrary indexed insertion with good asymptotics.
+        fn insert(self: *Self, at: usize, slice: []T) error{OutOfMemory}!void {
+            // a bookmark is a stack of layers
+            // find the last node at each layer before the point of insertion
+            // this is probabilistically log(n)
+            const bookmark = self.index(at);
+
+            // try writing the slice into the space of the last block
+            // if bookmark[0] is empty it means there are no blocks allocated yet, which is fine.
+            if (bookmark[0]) |node| {
+                // const block = node.down.block;
+                //todo
+                _ = node;
+            }
+
+            // build the blocks we will be appending
+            // this is linear with respect to the size of the slice
             const blocks = try Layer.blocksFromSlice(self.alloc, slice, self.layers[0]);
+
             // we go through each block and build a tower
             _ = blocks;
-            // we link the towers together and ensure that items_before is conserved in each layer.
+            // we link the towers together and ensure that items_before is conserved in each layer
         }
 
-        /// The famous log(n) index lookup.
+        // bookmark must by an array of non-null Layers,
+        // followed by only null Layers.
+        // This method will follow the pointer of each layer,
+        // and update the next node with the number of added elements.
+        fn reIndex(bookmark: Layers, added: usize) void {
+            for (0..k) |i| {
+                const node = bookmark[i] orelse break;
+                const next = node.next orelse continue;
+                next.items_before += added;
+            }
+        }
+
+        /// Famous log(n) index lookup.
         /// Returns a slice of layers, which can be used for inserting a new node.
-        /// The bottom-most layer (at index 0) contains a block
-        fn index(self: *Self, at: usize) Layers {
-            _ = self;
-            _ = at;
+        /// The bottom-most layer (at index 0) will contain a block if the KTable is not empty.
+        /// The index we are looking for is guaranteed to be in or at the end of the block.
+        /// We return the index of the first item in the block (`.block_index`).
+        /// This can be subtracted from at to determine
+        /// the relative offset of the item we are looking for within the block.
+        fn index(self: *Self, at: usize) struct {
+            .layers = Layers,
+            .height = usize,
+            .block_index = usize,
+        } {
+            // in at == len, this is the same as pushing to the end
+            assert(at <= self.len);
+
+            // to get to a good place, we need to start in a good place
+            // height is the first non-null block, we will start there
+            const bookmark: Layers = [_]?*Layer{null} ** layers;
+            if (self.height == 0) return .{
+                .layers = bookmark,
+                .height = 0,
+                .block_index = 0,
+            };
+            var layer: usize = self.height - 1;
+
+            // now we slide down the spine of self.layers,
+            // trying to find the topmost block still before our target index
+            // if I am thinking about this correctly,
+            // if we are respecting invariants,
+            // we should never hit the layer == 0 case without terminating
+            // of course I should test this further
+            while (self.layers[layer].?.items_before >= at) layer -= 1;
+
+            // now we have the first item in our bookmark, let's write it
+            // height is the number of layers in the bookmark, that's why we add 1
+            // from this point onwards we traverse pointers and don't need self.layers
+            bookmark[layer] = self.layers[layer];
+            const height = layer + 1;
+
+            // this is the important part
+            // we try skipping forward, and if that doesn't work, drop down a level
+            var seen = bookmark[layer].?.items_before;
+            while (true) {
+                // trust me bro
+                var go_down = true;
+                if (bookmark[layer].?.next) |next| {
+                    go_down = seen + next.items_before >= at;
+                }
+
+                // okay, you don't need to trust me
+                // to clean up the logic a bit,
+                // we figure out what we need to do
+                // and then we do it.
+                // by default we want to go down
+                // but if there's a node after,
+                // we might want to go forwards instead
+                // so we check if that node is a good idea to go to before going there
+                // and once we know what to do, we do it.
+                if (go_down) {
+                    switch (bookmark[layer].?.down) {
+                        .layer => |node| {
+                            layer -= 1;
+                            bookmark[layer] = node;
+                        },
+                        // we are at the bottom, what else is there to do?
+                        .block => break,
+                    }
+                } else {
+                    // if we can't go down, go forward!
+                    // next is guaranteed to not be null, because we checked earlier
+                    // I told you you needed to trust me
+                    const next = bookmark[layer].?.next.?;
+                    bookmark[layer] = next;
+                    seen += next.items_before;
+                }
+            }
+
+            // Isn't it so satisfying when it all threads together so nicely?
+            return .{
+                .layers = bookmark,
+                .height = height,
+                .block_index = seen,
+            };
         }
 
-        /// get a range of the KTable as a slice.
+        /// Get a range of the KTable as a slice.
         /// Walks the kTable and writes to a buffer.
+        /// Returns the number of items written.
         fn get(
             self: *Self,
             start: usize,
             end: usize,
             buffer: []T,
         ) usize {
-            std.debug.assert(start <= end);
+            assert(start <= end);
             const to_read = end - start;
             _ = self;
             _ = buffer;
